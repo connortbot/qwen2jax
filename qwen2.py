@@ -290,9 +290,7 @@ class QwenCausalSelfAttention(nn.Module):
             seq_len_k = k.shape[2]  # Length of keys, including cached keys
             
             if mask is not None and mask.shape[-2] < seq_len_k:
-                # Create a mask, initialized as all -inf
-                extended_mask = jnp.ones((B, 1, T, seq_len_k))
-                # In the last T positions of sequence dimension, set the mask to the values from original.
+                extended_mask = jnp.zeros((B, 1, T, seq_len_k))
                 extended_mask = extended_mask.at[:, :, :, -T:].set(mask[:, :, :T, :T])
                 mask = extended_mask
 
