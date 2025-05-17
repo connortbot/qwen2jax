@@ -9,6 +9,8 @@ import jax.tree as tree
 import os
 from functools import partial
 import numpy as np
+import tqdm as tqdm
+
 
 os.environ['JAX_PLATFORM_NAME'] = 'tpu'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -136,14 +138,14 @@ def rotate_half_jax(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
-def apply_rotary_emb(xq, xk, cos, sin): # Now takes cos, sin
+def apply_rotary_emb(xq, xk, cos, sin, offset=0): # Now takes cos, sin
     """Apply rotary embeddings using cos/sin like PyTorch."""
     # Ensure cos/sin are broadcastable (similar to unsqueeze_dim=1)
     # Assuming xq/xk shape is (B, T, H, D) or similar, need cos/sin like (1, T, 1, D)
     # Adjust slicing/unsqueezing based on actual shapes and how freqs_cis was passed before
     seq_len = xq.shape[1] # Assuming T is the sequence length dimension
-    cos = cos[:seq_len] # Slice to actual sequence length
-    sin = sin[:seq_len] # Slice to actual sequence length
+    cos = cos[offset:seq_len+offset] # Slice to actual sequence length
+    sin = sin[offset:seq_len+offset] # Slice to actual sequence length
     # Add necessary batch/head dims for broadcasting, e.g.:
     cos = jnp.expand_dims(cos, axis=(0, 2)) # Shape might become (1, T, 1, D)
     sin = jnp.expand_dims(sin, axis=(0, 2)) # Shape might become (1, T, 1, D)
@@ -226,7 +228,6 @@ class QwenCausalSelfAttention(nn.Module):
             kernel_init=nn.initializers.normal(config.initializer_range),
             use_bias=True
         )
-        # in llama3 its kernel_init=nn.initializers.variance_scaling(1.0, 'fan_in', 'normal')
 
         # Output projection
         self.wo = nn.Dense(
@@ -236,10 +237,6 @@ class QwenCausalSelfAttention(nn.Module):
             use_bias=False
         )
 
-        # Llama3 does QK normalization for stability but i don't think Qwen2 does so
-        # self.q_norm = RMSNorm(head_dim)
-        # self.k_norm = RMSNorm(head_dim)
-
     def __call__(
         self,
         x,
@@ -247,46 +244,38 @@ class QwenCausalSelfAttention(nn.Module):
         mask=None,
         deterministic=True,
         layer_idx=-1,
-        past_key_value=None,
+        past_key_values=None,
         use_cache=False,
     ):
         
         B, T, C = x.shape
-        config = self.config
         n_heads = self.config.n_heads
         n_kv_heads = self.config.n_kv_heads
         head_dim = C // n_heads
-
-        # logging projections
-        q_proj = self.wq(x)
-        k_proj = self.wk(x)
-        v_proj = self.wv(x)
 
         # Linear projections
         q = self.wq(x).reshape(B, T, n_heads, head_dim)
         k = self.wk(x).reshape(B, T, n_kv_heads, head_dim)
         v = self.wv(x).reshape(B, T, n_kv_heads, head_dim)
-
-        # once again, llama2 does QK normalization for stability but i don't think Qwen2 does so
-        # q = jnp.swapaxes(self.q_norm(jnp.swapaxes(q, 1, 2)), 1, 2)
-        # k = jnp.swapaxes(self.k_norm(jnp.swapaxes(k, 1, 2)), 1, 2)
-
-        # Apply rotary embeddings
-        # q, k = apply_rotary_emb(q, k, freqs_cis[:T])
-        q_rope, k_rope = apply_rotary_emb(q, k, freqs_cis[0], freqs_cis[1])
+       
+        offset = 0
+        if past_key_values is not None:
+            # then we need to set an offset, otherwise apply rotary emb
+            # will just assume we're at the start.
+            offset = past_key_values[0].shape[1]
+        q_rope, k_rope = apply_rotary_emb(q, k, freqs_cis[0], freqs_cis[1], offset=offset)
         
         q = q_rope
         k = k_rope
 
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            k = jnp.concatenate([past_key, k], axis=1)
-            v = jnp.concatenate([past_value, v], axis=1)
-        
         if use_cache:
-            present_key_value = (k, v)
+            if past_key_values is not None:
+                past_k, past_v = past_key_values
+                k = jnp.concatenate([past_k, k], axis=1)
+                v = jnp.concatenate([past_v, v], axis=1)
+            current_key_value = (k, v)
         else:
-            present_key_value = None
+            current_key_value = None
 
         # Repeat k and v heads if n_heads > n_kv_heads (grouped-query attention)
         if n_heads > n_kv_heads:
@@ -295,6 +284,17 @@ class QwenCausalSelfAttention(nn.Module):
 
         # Transpose tensors for attention computation (B, H, T, D)
         q, k, v = map(lambda x: jnp.swapaxes(x, 1, 2), (q, k, v))
+        
+        # Adjust attention mask for KV caching if needed
+        if use_cache and past_key_values is not None:
+            seq_len_k = k.shape[2]  # Length of keys, including cached keys
+            
+            if mask is not None and mask.shape[-2] < seq_len_k:
+                # Create a mask, initialized as all -inf
+                extended_mask = jnp.ones((B, 1, T, seq_len_k))
+                # In the last T positions of sequence dimension, set the mask to the values from original.
+                extended_mask = extended_mask.at[:, :, :, -T:].set(mask[:, :, :T, :T])
+                mask = extended_mask
 
         # Use flash attention (conceptually)
         output = flash_attention(q, k, v, mask)
@@ -302,7 +302,9 @@ class QwenCausalSelfAttention(nn.Module):
         # Transpose output and project back to full dimension
         output = jnp.swapaxes(output, 1, 2).reshape(B, T, -1)
         output = self.wo(output)
-
+        
+        if use_cache:
+            return output, current_key_value
         return output
 
 
@@ -387,31 +389,47 @@ class Qwen2Block(nn.Module):
         # Dropout (but qwen2 uses 0.0 by default)
         self.dropout = nn.Dropout(self.config.dropout_rate)
 
-    def __call__(self, hidden_states, freqs_cis, attention_mask=None, deterministic=True, layer_idx=-1):
+    def __call__(
+        self,
+        hidden_states,
+        freqs_cis,
+        attention_mask=None,
+        deterministic=True,
+        layer_idx=-1,
+        past_key_value=None,
+        use_cache=False,
+    ):
 
         residual = hidden_states
-        # To be absolutely clear, let's rename the variable passed to the norm
         norm_input = hidden_states
         normed_hidden_states = self.input_layernorm(norm_input)
-
-        # The input to self_attn is the output of the input_layernorm
-        attn_block_input = normed_hidden_states
         
-        attn_output_tensor = self.self_attn(
-            attn_block_input,
-            freqs_cis,
-            attention_mask,
-            deterministic,
-            layer_idx=layer_idx
-        )
+        if use_cache:
+            attn_output, current_key_value = self.self_attn(
+                normed_hidden_states,
+                freqs_cis,
+                attention_mask,
+                deterministic,
+                layer_idx=layer_idx,
+                past_key_values=past_key_value,
+                use_cache=use_cache,
+            )
+        else:
+            attn_output = self.self_attn(
+                normed_hidden_states,
+                freqs_cis,
+                attention_mask,
+                deterministic,
+                layer_idx=layer_idx,
+            )
+            current_key_value = None
 
         hidden_states = residual + self.dropout(
-            attn_output_tensor, # use the tensor output from attention
+            attn_output, # use the tensor output from attention
             deterministic=deterministic
         )
 
         residual = hidden_states
-        # To be absolutely clear
         mlp_input = self.post_attention_layernorm(hidden_states)
         
         hidden_states = residual + self.dropout(
@@ -419,6 +437,8 @@ class Qwen2Block(nn.Module):
             deterministic=deterministic
         )
 
+        if use_cache:
+            return hidden_states, current_key_value
         return hidden_states
 
 
@@ -488,127 +508,291 @@ class Qwen2(nn.Module):
         self,
         input_ids,
         attention_mask=None, # for sliding window
-        position_ids=None,
         deterministic=True,
-        params=None
+        params=None,
+        past_key_values=None,
+        use_cache=False,
     ):
-        # blocks -> layers
-        # norm_f -> norm
-        # token_embedding -> embed_tokens
         B, T = input_ids.shape
 
-        # Apply weight tying if enabled (only during inference)
         if params is not None and self.apply_weight_tying and not deterministic:
             params = self._tie_weights(params)
-
-        # llama3 creates a max_seq_len x max_seq_len mask
-        # but qwen2 creates T x T mask which is the curr seq len (ig more efficient)
-        # and qwen2 allows for custom attnetion mask input for sliding window attention
+        
         if attention_mask is None:
-            mask = jnp.tril(
-            jnp.ones((self.config.max_seq_len, self.config.max_seq_len))
-            )
-            mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
-            attention_mask = mask[None, None, :T, :T]
+            if use_cache and past_key_values is not None:
+                # The mask is handled differently in KV caching
+                past_length = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+                # Now create a mask allowing new tokens to attend to all previous tokens
+                # i.e 0,0,0,0.....
+                full_seq_len = past_length + T
+                mask = jnp.ones((T, full_seq_len)) # should we set dtype to config dtype?
+                causal_mask = jnp.tril(jnp.ones((T, T)))
+                mask = mask.at[:, past_length:].set(causal_mask)
+                mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
+                attention_mask = mask[None, None, :, :]
+            else:
+                mask = jnp.tril(jnp.ones((self.config.max_seq_len, self.config.max_seq_len)))
+                mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
+                attention_mask = mask[None, None, :T, :T]
 
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
+        
+        current_key_values = [] if use_cache else None
 
         # Apply transformer blocks
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(
+            past_key_value = None if past_key_values is None else past_key_values[i]
+            
+            if use_cache and current_key_values is not None:
+                hidden_states, current_key_value = layer(
+                    hidden_states,
+                    self.freqs_cis,
+                    attention_mask,
+                    deterministic,
+                    layer_idx=i,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache
+                )
+                current_key_values.append(current_key_value)
+            else:
+                hidden_states = layer(
                 hidden_states,
                 self.freqs_cis,
                 attention_mask,
                 deterministic,
                 layer_idx=i
             )
-            if i == 0:
-              layer_0_output_pt = hidden_states
 
         # Apply final normalization
         hidden_states = self.norm(hidden_states)
 
         # Get logits
         logits = self.lm_head(hidden_states)
-
+        
+        if use_cache:
+            return logits, current_key_values
         return logits
+    
+    def _generate_first(self, input_ids, attention_mask=None, deterministic=True):
+        return self(
+            input_ids,
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            use_cache=True,
+        )
+
+    def _generate_rest(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        deterministic=True,
+    ):
+        return self(
+            input_ids,
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
 
     def generate(
         self,
         input_ids,
-        max_new_tokens,
-        temperature=0.7,
-        top_k=20,
-        top_p=0.8,
+        max_new_tokens: int = 20,
+        temperature=None,
+        top_k=None,
+        top_p=None,
         rng_key=None,
+        debug=False,
     ):
-        temperature = self.config.temperature
-        top_k = self.config.top_k
-        top_p = self.config.top_p
+        temperature = temperature if temperature is not None else self.config.temperature
+        top_k = top_k if top_k is not None else self.config.top_k
+        top_p = top_p if top_p is not None else self.config.top_p
 
-        """Generate text using the model"""
+
+
         B, T = input_ids.shape
 
         if rng_key is None:
             rng_key = random.PRNGKey(0)
 
-        # Create initial output array
         output = input_ids
+        logits, past_key_values = self._generate_first(input_ids, deterministic=True)
 
-        # Generate tokens
-        for _ in range(max_new_tokens):
-            # Keep the context within max sequence length
-            curr_input = output[:, -self.config.max_seq_len:]
-            curr_length = curr_input.shape[1]
+        if debug:
+            iterator = tqdm.tqdm(range(max_new_tokens), desc="Generating tokens")
+        else:
+            iterator = range(max_new_tokens)
 
-            # qwen2 reqs making explicit attention mask creation
-            mask = jnp.tril(
-                jnp.ones((self.config.max_seq_len, self.config.max_seq_len))
-            )
-            mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
-            attention_mask = mask[None, None, :T, :T]
+        for _ in iterator:
+            next_token_logits = logits[:, -1, :]
+            next_token_logits = next_token_logits / temperature
 
-            # Get logits for the next token
-            logits = self(curr_input, attention_mask=attention_mask, deterministic=True)
-            logits = logits[:, -1, :]
-
-            # Apply temperature
-            logits = logits / temperature
-
-            # Apply top-k filtering
             if top_k > 0:
-                top_k_v, top_k_i = jax.lax.top_k(logits, top_k)
+                top_k_v, top_k_i = jax.lax.top_k(next_token_logits, top_k)
                 indices_to_remove = jnp.broadcast_to(
-                    jnp.arange(logits.shape[-1]) < top_k_i[:, -1:],
-                    logits.shape
+                    jnp.arange(next_token_logits.shape[-1]) < top_k_i[:, -1:],
+                    next_token_logits.shape
                 )
-                logits = jnp.where(indices_to_remove, logits, jnp.finfo(jnp.float32).min)
-
+                next_token_logits = jnp.where(indices_to_remove, next_token_logits, jnp.finfo(jnp.float32).min)
+                
             # Apply top-p (nucleus) filtering
             if top_p < 1.0:
-                sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]  # Sort indices in descending order
-                sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)  # Get sorted values
-
+                sorted_indices = jnp.argsort(next_token_logits, axis=-1)[:, ::-1]
+                sorted_logits = jnp.take_along_axis(next_token_logits, sorted_indices, axis=-1)
                 cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
-
-                # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
-                # Shift the indices to the right to keep the first token above threshold
                 sorted_indices_to_remove = jnp.roll(sorted_indices_to_remove, 1, axis=1)
                 sorted_indices_to_remove = sorted_indices_to_remove.at[:, 0].set(False)
-
-                # Scatter sorted tensors to original indexing
-                indices_to_remove = jnp.zeros_like(logits, dtype=bool)
+                indices_to_remove = jnp.zeros_like(next_token_logits, dtype=bool)
                 indices_to_remove = indices_to_remove.at[jnp.arange(B)[:, None], sorted_indices].set(sorted_indices_to_remove)
+                next_token_logits = jnp.where(indices_to_remove, jnp.finfo(self.config.dtype).min, next_token_logits)
 
-                logits = jnp.where(indices_to_remove, jnp.finfo(self.config.dtype).min, logits)
-
-            # Sample from the filtered distribution
+            
             rng_key, sample_key = random.split(rng_key)
-            next_token = random.categorical(sample_key, logits, shape=(B,))
-
+            next_token = random.categorical(sample_key, next_token_logits, shape=(B,))
+           
             # Append the sampled token to the sequence
             output = jnp.concatenate([output, next_token[:, None]], axis=1)
+            
+            # Process only the new token with cached KVs
+            next_token_input = next_token[:, None]  # Shape [B, 1]
+            
+            # Forward pass with KV cache
+            logits, past_key_values = self._generate_rest(
+                next_token_input, 
+                past_key_values=past_key_values,
+                deterministic=True
+            )
 
         return output
+    
+    def generate_streaming(
+        self,
+        input_ids,
+        max_new_tokens: int = 20,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+        rng_key=None,
+    ):
+
+        temperature = temperature if temperature is not None else self.config.temperature
+        top_k = top_k if top_k is not None else self.config.top_k
+        top_p = top_p if top_p is not None else self.config.top_p
+
+        B, T = input_ids.shape
+
+        if rng_key is None:
+            rng_key = random.PRNGKey(0)
+
+        output = input_ids
+        logits, past_key_values = self._generate_first(input_ids, deterministic=True)
+
+        count = 0
+        while count < max_new_tokens:
+            next_token_logits = logits[:, -1, :]
+            next_token_logits = next_token_logits / temperature
+
+            if top_k > 0:
+                top_k_v, top_k_i = jax.lax.top_k(next_token_logits, top_k)
+                indices_to_remove = jnp.broadcast_to(
+                    jnp.arange(next_token_logits.shape[-1]) < top_k_i[:, -1:],
+                    next_token_logits.shape
+                )
+                next_token_logits = jnp.where(indices_to_remove, next_token_logits, jnp.finfo(jnp.float32).min)
+                
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_indices = jnp.argsort(next_token_logits, axis=-1)[:, ::-1]
+                sorted_logits = jnp.take_along_axis(next_token_logits, sorted_indices, axis=-1)
+                cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove = jnp.roll(sorted_indices_to_remove, 1, axis=1)
+                sorted_indices_to_remove = sorted_indices_to_remove.at[:, 0].set(False)
+                indices_to_remove = jnp.zeros_like(next_token_logits, dtype=bool)
+                indices_to_remove = indices_to_remove.at[jnp.arange(B)[:, None], sorted_indices].set(sorted_indices_to_remove)
+                next_token_logits = jnp.where(indices_to_remove, jnp.finfo(self.config.dtype).min, next_token_logits)
+
+            rng_key, sample_key = random.split(rng_key)
+            next_token = random.categorical(sample_key, next_token_logits, shape=(B,))
+           
+            # Append the sampled token to the sequence
+            output = jnp.concatenate([output, next_token[:, None]], axis=1)
+            
+            # Process only the new token with cached KVs
+            next_token_input = next_token[:, None]  # Shape [B, 1]
+
+            yield next_token_input
+            
+            # Forward pass with KV cache
+            logits, past_key_values = self._generate_rest(
+                next_token_input, 
+                past_key_values=past_key_values,
+                deterministic=True
+            )
+            
+            count += 1
+        return
+
+
+
+def generate_with_chat_template(model, model_params, tokenizer, messages, max_new_tokens=100, temperature=0.7, top_k=20, top_p=0.8, rng_key=None, debug=False, streaming=False):
+    """Generate text response using the chat template and KV caching"""
+    # Format the chat messages
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
+    
+    # Encode the formatted prompt
+    input_tokens = tokenizer.encode(formatted_prompt, padding=True, return_tensors="np")
+    input_tokens_jax = jnp.array(input_tokens, dtype=jnp.int32)
+    
+    print("Input tokens shape:", input_tokens.shape)
+    print(formatted_prompt)
+
+    if streaming:
+        stream = model.apply(
+            model_params,  # Pass model_params first
+            input_tokens_jax,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            rng_key=rng_key,
+            method=model.generate_streaming,
+        )
+        
+        for token in stream:
+            # Every other token is the actual token we want to decode
+            # (the other is just for internal state tracking)
+            decoded_token = tokenizer.decode(token[0].tolist(), skip_special_tokens=True)
+            if decoded_token:  # Only yield non-empty tokens
+                yield decoded_token
+        return
+
+
+    # Generate using the model with KV caching
+    output_tokens = model.apply(
+        model_params,
+        input_tokens_jax,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        rng_key=rng_key,
+        method=model.generate,
+        debug=debug,
+    )
+    
+    # Decode the generated tokens
+    generated_text = tokenizer.decode(output_tokens[0].tolist(), skip_special_tokens=True)
+    
+    # Extract just the model's response (removing the prompt)
+    response = generated_text[len(formatted_prompt):]
+   
+    return response
