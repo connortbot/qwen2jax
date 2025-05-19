@@ -31,10 +31,6 @@ Llama3 just 4x the original dim, but Qwen2.5-0.5b multiplies it by 5.4x.
 THe config below is modified so that the hidden_dim (intermediate size) is specified.
 """
 
-def outputshit(x, *args, **kwargs):
-    if False:
-        outputshit(x, *args, **kwargs)
-
 @dataclass(frozen=True)
 class Qwen2Config:
     """Configuration for Qwen2 model"""
@@ -245,7 +241,6 @@ class QwenCausalSelfAttention(nn.Module):
         n_heads = self.config.n_heads
         n_kv_heads = self.config.n_kv_heads
         head_dim = C // n_heads
-        outputshit(n_heads, n_kv_heads, head_dim)
 
         # Linear projections
         q = self.wq(x).reshape(B, T, n_heads, head_dim)
@@ -258,7 +253,6 @@ class QwenCausalSelfAttention(nn.Module):
             # will just assume we're at the start.
             offset = past_key_values[0].shape[1]
         q_rope, k_rope = apply_rotary_emb(q, k, freqs_cis[0], freqs_cis[1], offset=offset)
-        outputshit("post rope shapes: ", q_rope.shape, k_rope.shape) 
         q = q_rope
         k = k_rope
 
@@ -268,21 +262,15 @@ class QwenCausalSelfAttention(nn.Module):
                 k = jnp.concatenate([past_k, k], axis=1)
                 v = jnp.concatenate([past_v, v], axis=1)
             current_key_value = (k, v)
-            outputshit(len(current_key_value))
-            outputshit(current_key_value[0].shape, current_key_value[1].shape)
         else:
             current_key_value = None
         # Repeat k and v heads if n_heads > n_kv_heads (grouped-query attention)
         if n_heads > n_kv_heads:
             k = jnp.repeat(k, n_heads // n_kv_heads, axis=2)
             v = jnp.repeat(v, n_heads // n_kv_heads, axis=2)
-        outputshit("post repeat shapes: ", k.shape, v.shape)
 
 
         q, k, v = map(lambda x: jnp.swapaxes(x, 1, 2), (q, k, v))
-        outputshit("post swapaxes shapes: ", q.shape, k.shape, v.shape)
-        outputshit(use_cache)
-        outputshit(past_key_values is not None)
         
         # Adjust attention mask for KV caching if needed
         if use_cache and past_key_values is not None:
@@ -293,18 +281,10 @@ class QwenCausalSelfAttention(nn.Module):
                 extended_mask = extended_mask.at[:, :, :, -T:].set(mask[:, :, :T, :T])
                 mask = extended_mask
 
-        outputshit("flash attention inputs: ", q.shape, k.shape, v.shape)
-        if mask is not None:
-            if mask.shape:
-                outputshit(mask.shape)
-
         output = flash_attention(q, k, v, mask)
-        outputshit("flash attention output shape: ", output.shape)
 
         output = jnp.swapaxes(output, 1, 2).reshape(B, T, -1)
-        outputshit(output.shape)
         output = self.wo(output)
-        outputshit(output.shape)
         
         if use_cache:
             return output, current_key_value
@@ -406,7 +386,6 @@ class Qwen2Block(nn.Module):
         residual = hidden_states
         norm_input = hidden_states
         normed_hidden_states = self.input_layernorm(norm_input)
-        outputshit("Normed hidden states shape: ", normed_hidden_states.shape)
         
         if use_cache:
             attn_output, current_key_value = self.self_attn(
@@ -440,7 +419,6 @@ class Qwen2Block(nn.Module):
             self.mlp(mlp_input),
             deterministic=deterministic
         )
-        outputshit("Block output: ", hidden_states.shape)
         if use_cache:
             return hidden_states, current_key_value
         return hidden_states
@@ -531,11 +509,9 @@ class Qwen2(nn.Module):
                 mask = jnp.tril(jnp.ones((self.config.max_seq_len, self.config.max_seq_len)))
                 mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
                 attention_mask = mask[None, None, :T, :T]
-        outputshit("Attention mask shape: ", attention_mask.shape)
 
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
-        outputshit("Embedding output shape: ", hidden_states.shape)
         
         current_key_values = [] if use_cache else None
 
@@ -568,7 +544,6 @@ class Qwen2(nn.Module):
 
         # Get logits
         logits = self.lm_head(hidden_states)
-        outputshit("Logits shape: ", logits.shape)
         
         if use_cache:
             return logits, current_key_values
@@ -666,7 +641,6 @@ class Qwen2(nn.Module):
 
         count = 0
         while count < max_new_tokens:
-            outputshit("===========count==========")
             next_token_logits = logits[:, -1, :]
             next_token = jnp.argmax(next_token_logits, axis=-1) 
             
@@ -675,7 +649,6 @@ class Qwen2(nn.Module):
 
             yield next_token
             
-            outputshit("Next token input shape: ", next_token_input.shape)
             # Forward pass with KV cache
             logits, past_key_values = self._generate_rest(
                 next_token_input, 
