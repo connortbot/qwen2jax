@@ -1,3 +1,4 @@
+
 import flax.linen as nn
 import jax
 from jax import random, lax, vmap
@@ -11,66 +12,13 @@ from functools import partial
 import numpy as np
 import tqdm as tqdm
 
+from jax import lax
+
+from config import Qwen2Config
 
 os.environ['JAX_PLATFORM_NAME'] = 'tpu'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 print("JAX devices:", jax.devices())
-
-# Implementations for many elements, such as RoPE, RMSNorm, etc. taken from:
-# https://github.com/dhyaneesh/awesome-jax-flax-llms/tree/main
-# most modifications were to adapt to the Qwen2 arch
-"""
-dim -> hidden_size
-hidden_dim -> intermediate_size
-
-Something that confused me when i did solomonoff a while ago and yet again confused me again
-The "base dimension for the model" is typically "dim". However, huggingface models call it "hidden_size"
-
-Then, the intermediate_size is the expanded dimension in the multi-layer perceptron.
-Llama3 just 4x the original dim, but Qwen2.5-0.5b multiplies it by 5.4x.
-THe config below is modified so that the hidden_dim (intermediate size) is specified.
-"""
-
-@dataclass(frozen=True)
-class Qwen2Config:
-    """Configuration for Qwen2 model"""
-    vocab_size: int = 151936
-    dim: int = 896  # "hidden_size" as typically labeled in im the centre of the universe huggingface
-    n_layers: int = 24  # "num_hidden_layers"
-    n_heads: int = 14  # "num_attention_heads"
-    n_kv_heads: int = 2  # "num_key_value_heads" for gqa
-    hidden_dim: int = 4864 # "intermediate_size", in Qwen2.5-0.5b its 5.4x hidden_size, or dim*5.4
-    hidden_act: str = "silu" # "hidden_act", activation function, in Qwen2.5-0.5b its silu whereas llama2 is stupid swiglu
-    max_seq_len: int = 32768  # "max_position_embeddings", Maximum sequence length, or "max_position_embeddings"
-
-    dropout_rate: float = 0.0  # "attention_dropout"
-
-    initializer_range: float = 0.02 # used for weight init
-    dtype: jnp.dtype = jnp.bfloat16  # Using bfloat16 for TPU optimization
-
-    # RoPE settings
-    rope_theta: float = 1000000.0  # Base for rotary embeddings
-
-    # Attention settings
-    rms_norm_eps: float = 1e-6 # rms norm epsilon
-    use_cache: bool = True
-    use_sliding_window: bool = False
-    sliding_window: int = 32768
-    max_window_layers: int = 21
-
-    # Training settings, idk what to set defaults for these to
-    batch_size: int = 16
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.1
-    warmup_steps: int = 1000
-    max_steps: int = 100000
-
-    # Generation settings copied from qwen-0.5b-instruct generation config on HF
-    temperature: float = 0.7
-    top_k: int = 20
-    top_p: float = 0.8
-
-
 
 #####################
 # RMSNorm #
@@ -261,6 +209,7 @@ class QwenCausalSelfAttention(nn.Module):
                 past_k, past_v = past_key_values
                 k = jnp.concatenate([past_k, k], axis=1)
                 v = jnp.concatenate([past_v, v], axis=1)
+                print(k.shape, v.shape)
             current_key_value = (k, v)
         else:
             current_key_value = None
