@@ -1,4 +1,3 @@
-
 import flax.linen as nn
 import jax
 from jax import random, lax, vmap
@@ -521,6 +520,21 @@ class Qwen2(nn.Module):
             use_cache=True,
         )
 
+    @partial(jax.jit, static_argnames=['deterministic'])
+    def _generate_rest_jit(
+        self,
+        input_ids,
+        past_key_values,
+        deterministic=True,
+    ):
+        return self(
+            input_ids,
+            attention_mask=None,
+            deterministic=deterministic,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+
     def generate(
         self,
         input_ids,
@@ -535,8 +549,6 @@ class Qwen2(nn.Module):
         top_k = top_k if top_k is not None else self.config.top_k
         top_p = top_p if top_p is not None else self.config.top_p
 
-
-
         B, T = input_ids.shape
 
         if rng_key is None:
@@ -545,14 +557,21 @@ class Qwen2(nn.Module):
         output = input_ids
         logits, past_key_values = self._generate_first(input_ids, deterministic=True)
 
+        rng_keys = random.split(rng_key, max_new_tokens) # pre split more efficient apparently
+
         if debug:
             iterator = tqdm.tqdm(range(max_new_tokens), desc="Generating tokens")
         else:
             iterator = range(max_new_tokens)
 
-        for _ in iterator:
-            next_token_logits = logits[:, -1, :]
-            next_token = jnp.argmax(next_token_logits, axis=-1)
+        for i in iterator:
+            next_token = _sample_next_token(
+                logits, 
+                rng_keys[i], 
+                temperature=temperature, 
+                top_k=top_k, 
+                top_p=top_p
+            )
            
             # Append the sampled token to the sequence
             output = jnp.concatenate([output, next_token[:, None]], axis=1)
@@ -586,28 +605,28 @@ class Qwen2(nn.Module):
         if rng_key is None:
             rng_key = random.PRNGKey(0)
 
-        kv_cache = create_kv_cache(1, self.config)
-
         logits, past_key_values = self._generate_first(input_ids, deterministic=True)
 
-        count = 0
-        while count < max_new_tokens:
-            next_token_logits = logits[:, -1, :]
-            next_token = jnp.argmax(next_token_logits, axis=-1) 
+        rng_keys = random.split(rng_key, max_new_tokens)
+        
+        for i in range(max_new_tokens):
+            next_token = _sample_next_token(
+                logits, 
+                rng_keys[i], 
+                temperature=temperature, 
+                top_k=top_k, 
+                top_p=top_p
+            )
             
-            # Process only the new token with cached KVs
-            next_token_input = next_token[:, None]  # Shape [B, 1]
-
             yield next_token
             
-            # Forward pass with KV cache
-            logits, past_key_values = self._generate_rest(
+            next_token_input = next_token[:, None]  # Shape [B, 1]
+            logits, past_key_values = self._generate_rest_jit(
                 next_token_input, 
                 past_key_values=past_key_values,
                 deterministic=True
             )
-            
-            count += 1
+        
         return
 
 
@@ -669,3 +688,47 @@ def generate_with_chat_template(model, model_params, tokenizer, messages, max_ne
     response = generated_text[len(formatted_prompt):]
    
     return response
+
+@partial(jax.jit, static_argnames=['temperature', 'top_k', 'top_p'])
+def _sample_next_token(logits, rng_key, temperature=1.0, top_k=None, top_p=None):
+    next_token_logits = logits[:, -1, :]
+    
+    if temperature > 0.0:
+        next_token_logits = next_token_logits / temperature
+    
+    if top_k is not None and top_k > 0:
+        k = min(top_k, next_token_logits.shape[-1])
+        top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, k=k)
+        
+        mask = jnp.full_like(next_token_logits, jnp.finfo(next_token_logits.dtype).min)
+        batch_indices = jnp.arange(next_token_logits.shape[0])[:, None]
+        next_token_logits = mask.at[batch_indices, top_k_indices].set(top_k_logits)
+    
+    if top_p is not None and top_p < 1.0:
+        sorted_indices = jnp.argsort(next_token_logits, axis=-1)[:, ::-1]
+        sorted_logits = jnp.take_along_axis(next_token_logits, sorted_indices, axis=-1)
+        
+        sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+        cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
+        
+        cutoff_mask = cumulative_probs <= top_p
+        cutoff_mask = cutoff_mask.at[:, 0].set(True)
+        
+        sorted_logits = jnp.where(
+            cutoff_mask,
+            sorted_logits,
+            jnp.finfo(sorted_logits.dtype).min
+        )
+        
+        next_token_logits = jnp.take_along_axis(
+            sorted_logits,
+            jnp.argsort(sorted_indices, axis=-1),
+            axis=-1
+        )
+    
+    if temperature == 0.0:
+        next_token = jnp.argmax(next_token_logits, axis=-1)
+    else:
+        next_token = jax.random.categorical(rng_key, next_token_logits, axis=-1)
+    
+    return next_token
