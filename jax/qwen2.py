@@ -13,7 +13,7 @@ import tqdm as tqdm
 
 from jax import lax
 
-from config import Qwen2Config
+from .config import Qwen2Config
 
 os.environ['JAX_PLATFORM_NAME'] = 'tpu'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -520,21 +520,6 @@ class Qwen2(nn.Module):
             use_cache=True,
         )
 
-    @partial(jax.jit, static_argnames=['deterministic'])
-    def _generate_rest_jit(
-        self,
-        input_ids,
-        past_key_values,
-        deterministic=True,
-    ):
-        return self(
-            input_ids,
-            attention_mask=None,
-            deterministic=deterministic,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-
     def generate(
         self,
         input_ids,
@@ -621,7 +606,7 @@ class Qwen2(nn.Module):
             yield next_token
             
             next_token_input = next_token[:, None]  # Shape [B, 1]
-            logits, past_key_values = self._generate_rest_jit(
+            logits, past_key_values = self._generate_rest(
                 next_token_input, 
                 past_key_values=past_key_values,
                 deterministic=True
