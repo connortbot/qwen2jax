@@ -15,14 +15,8 @@ from jax import lax
 
 from .config import Qwen2Config
 
-os.environ['JAX_PLATFORM_NAME'] = 'gpu'
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
-os.environ['XLA_FLAGS'] = (
-    '--xla_gpu_enable_triton_softmax_fusion=true '
-    '--xla_gpu_triton_gemm_any=True '
-    '--xla_gpu_enable_async_all_gather=true'
-)
+os.environ['JAX_PLATFORM_NAME'] = 'tpu'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 print("JAX devices:", jax.devices())
 
 #####################
@@ -53,7 +47,6 @@ class RMSNorm(nn.Module):
 # Rotary Position Embeddings (RoPE hehe) #
 #########################
 
-@partial(jax.jit, static_argnames=['dim', 'max_seq_len', 'theta'])
 def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 1000000.0, config: Qwen2Config = Qwen2Config()):
     """Precompute the frequency tensor for complex exponentials (rotary embeddings)."""
     # Use float32 for intermediate calculations
@@ -76,13 +69,11 @@ def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 1000000.0, c
     sin = jnp.sin(emb).astype(config.dtype) # Cast back to model dtype # bfloat
     return cos, sin # Return cos and sin separately
 
-@jax.jit
 def rotate_half_jax(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
-@jax.jit
 def apply_rotary_emb(xq, xk, cos, sin, offset=0): # Now takes cos, sin
     """Apply rotary embeddings using cos/sin like PyTorch."""
     # Ensure cos/sin are broadcastable (similar to unsqueeze_dim=1)
