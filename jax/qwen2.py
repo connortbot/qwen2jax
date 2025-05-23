@@ -208,7 +208,6 @@ class QwenCausalSelfAttention(nn.Module):
                 past_k, past_v = past_key_values
                 k = jnp.concatenate([past_k, k], axis=1)
                 v = jnp.concatenate([past_v, v], axis=1)
-                print(k.shape, v.shape)
             current_key_value = (k, v)
         else:
             current_key_value = None
