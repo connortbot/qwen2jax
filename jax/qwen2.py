@@ -14,7 +14,6 @@ import tqdm as tqdm
 from jax import lax
 
 from .config import Qwen2Config
-from .kv_cache import create_kv_cache
 
 os.environ['JAX_PLATFORM_NAME'] = 'tpu'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -209,6 +208,7 @@ class QwenCausalSelfAttention(nn.Module):
                 past_k, past_v = past_key_values
                 k = jnp.concatenate([past_k, k], axis=1)
                 v = jnp.concatenate([past_v, v], axis=1)
+                print(k.shape, v.shape)
             current_key_value = (k, v)
         else:
             current_key_value = None
