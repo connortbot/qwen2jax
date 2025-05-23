@@ -13,7 +13,7 @@ import tqdm as tqdm
 
 from jax import lax
 
-from .config import Qwen2Config
+from config import Qwen2Config
 
 os.environ['JAX_PLATFORM_NAME'] = 'tpu'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
