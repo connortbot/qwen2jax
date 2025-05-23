@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 
-from config import Qwen2Config
+from .config import Qwen2Config
 
 def create_kv_cache(batch_size: int, config: Qwen2Config):
     output = {}
